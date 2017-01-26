@@ -176,11 +176,14 @@
 - (void)pluginInitialize
 {
   [super pluginInitialize];
-
   peripheralAndUUID = [[NSMutableDictionary alloc] init];
+  
+  self.subscribedCentral = nil;
+  self.sendCharacteristic = nil;
+  self.messageQueue = [[NSMutableArray alloc] init];
+  
   isEndOfAddService = FALSE;
   isFindingPeripheral = FALSE;
-  self.isAdvertisingStopped = FALSE;
 
   myPeripheralManager = [[CBPeripheralManager alloc] initWithDelegate:self queue:nil];
   myCentralManager = [[CBCentralManager alloc] initWithDelegate:self queue:nil];
@@ -533,7 +536,18 @@
     if ([self existCommandArguments:command.arguments]) {
         [self.callbacks setValue:command.callbackId forKey:ADDSERVICE];
  
-        NSMutableArray *services = [[NSMutableArray alloc] initWithArray:[[command.arguments objectAtIndex:0] valueForKey:SERVICES]];
+        NSString* jsonString = [command.arguments objectAtIndex:0]; // this is the JSON to convert from
+        NSError* error = nil;
+        id object = [NSJSONSerialization JSONObjectWithData:[jsonString dataUsingEncoding:NSUTF8StringEncoding]
+                                                    options:NSJSONReadingMutableContainers
+                                                      error:&error];
+        
+        if (error != nil) {
+            NSLog(@"NSString can't be converted to an NSArray/NSDictionary error: %@", [error localizedDescription]);
+        }
+        
+        NSMutableArray *services = [[NSMutableArray alloc] initWithArray:[object valueForKey:SERVICES]];
+        
         if (services.count > 0) {
             CBMutableDescriptor *newDescriptor;
             for (int i=0; i < services.count; i++) {
@@ -645,41 +659,132 @@
     }
 }
 
-- (void)notify:(CDVInvokedUrlCommand*)command {
-  if ([self existCommandArguments:command.arguments]) {
-    NSData *data;
-    BOOL notified;
-    NSString *uniqueID;
-    NSString *characteristicIndex;
-    CBMutableCharacteristic *characteristic;
+- (void)notifyUntilEmptyOrError
+{
+  BOOL notified;
+  
+  notified = TRUE;
+  
+  while ((TRUE == notified) && (self.messageQueue.count > 0))
+  {
+    NSData *chunk;
+    NSUInteger max;
+    NSMutableData *remainder;
+  
+    remainder = [self.messageQueue objectAtIndex:0];
+    NSLog(@"Taking message out of Queue; length: %lu", remainder.length);
+    
+    max = self.subscribedCentral.maximumUpdateValueLength;
+  
+    while ((TRUE == notified) && (remainder.length > 0))
+    {
+      NSRange range;
 
-    uniqueID = [self getCommandArgument:command.arguments fromKey:UINQUE_ID];
-      data = [[NSData alloc] initWithBase64EncodedString:[self getCommandArgument:command.arguments fromKey:DATA] options:0];
-    characteristicIndex = [self getCommandArgument:command.arguments fromKey:CHARACTERISTIC_INDEX];
-    characteristic = [self getNotifyCharacteristic:uniqueID characteristicIndex:characteristicIndex];
-
-    notified = [self.self.myPeripheralManager updateValue:data forCharacteristic:characteristic onSubscribedCentrals:nil];
-
-    if (notified){
-      NSLog(@"-updateValue succeeded");
-      CDVPluginResult* result;
-      NSMutableDictionary *info;
-
-      info = [[NSMutableDictionary alloc] init];
-      [info setValue:SUCCESS forKey:MES];
-      result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:info];
-
-      [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
-    } else {
-      NSLog(@"-updateValue postponed");
-
-      self.notifyData = data;
-      self.notifyCallbackId = command.callbackId;
-      self.notifyCharacteristic = characteristic;
+      range.location = 0;
+      range.length = (max < remainder.length) ? max : remainder.length;
+      
+      chunk = [remainder subdataWithRange:range];
+      
+      notified = [myPeripheralManager updateValue:chunk forCharacteristic:self.sendCharacteristic onSubscribedCentrals:nil];
+      
+      if (TRUE == notified)
+      {
+        NSLog(@"Sent chunk of length %lu", chunk.length);
+        
+        range.location = range.length;
+        range.length = remainder.length - range.length;
+        
+        remainder = [[NSMutableData alloc] initWithData: [remainder subdataWithRange:range]];
+        [self.messageQueue replaceObjectAtIndex:0 withObject: remainder];
+        
+        NSLog(@"Remainder has new length %lu", remainder.length);
+      }
+      else
+      {
+        NSLog(@"Postponed chunk of length %lu", chunk.length);
+      }
     }
-  } else {
-    NSLog(@"-notify was called with insufficient arguments");
+    
+    if (remainder.length == 0) {
+      [self.messageQueue removeObjectAtIndex:0];
+      NSLog(@"Removed object from message queue; count: %lu", self.messageQueue.count);
+    }
+  }
+}
+
+// the javascript will send messages that are not split up into chunks, the peer expects that messages are sent in chunks due to
+// the limited mtu; and the peer expects as well that only one message is sent at a time.
+- (void)notifyBeforeTIPatch:(CDVInvokedUrlCommand*)command
+{
+  NSString *uniqueID;
+  NSMutableData *data;
+  CDVPluginResult* result;
+  NSMutableDictionary *info;
+  NSString *characteristicIndex;
+
+  info = [[NSMutableDictionary alloc] init];
+  uniqueID = [self getCommandArgument:command.arguments fromKey:UINQUE_ID];
+  characteristicIndex = [self getCommandArgument:command.arguments fromKey:CHARACTERISTIC_INDEX];
+  self.sendCharacteristic = [self getNotifyCharacteristic:uniqueID characteristicIndex:characteristicIndex];
+  data = [[NSData alloc] initWithBase64EncodedString:[self getCommandArgument:command.arguments fromKey:DATA] options:0];
+  
+  if (0 < self.messageQueue.count)
+  {
+    [self.messageQueue addObject: data];
+  }
+  else
+  {
+    [self.messageQueue addObject: data];
+    [self notifyUntilEmptyOrError];
+  }
+  
+  [info setValue:SUCCESS forKey:MES];
+  result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:info];
+  [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+}
+
+- (void)notifyAfterTIPatch:(CDVInvokedUrlCommand*)command
+{
+  NSString *uniqueID;
+  NSMutableData *data;
+  NSMutableData *existing;
+  CDVPluginResult* result;
+  NSMutableDictionary *info;
+  NSString *characteristicIndex;
+
+  info = [[NSMutableDictionary alloc] init];
+  uniqueID = [self getCommandArgument:command.arguments fromKey:UINQUE_ID];
+  characteristicIndex = [self getCommandArgument:command.arguments fromKey:CHARACTERISTIC_INDEX];
+  self.sendCharacteristic = [self getNotifyCharacteristic:uniqueID characteristicIndex:characteristicIndex];
+  data = [[NSData alloc] initWithBase64EncodedString:[self getCommandArgument:command.arguments fromKey:DATA] options:0];
+  
+  if (0 < self.messageQueue.count)
+  {
+    existing = [self.messageQueue objectAtIndex: 0];
+    [existing appendData: data];
+  }
+  else
+  {
+    [self.messageQueue addObject:data];
+    [self notifyUntilEmptyOrError];
+  }
+  
+  [info setValue:SUCCESS forKey:MES];
+  result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:info];
+  [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+}
+
+- (void)notify:(CDVInvokedUrlCommand*)command {
+  if (![self existCommandArguments:command.arguments]) {
+    NSLog(@"'notify' was called with insufficient arguments");
     [self error:command.callbackId];
+    return;
+  }
+  
+  if (self.subscribedCentral.maximumUpdateValueLength <= 20) {
+    [self notifyBeforeTIPatch: command];
+  } else {
+    [self notifyAfterTIPatch: command];
   }
 }
 
@@ -695,11 +800,13 @@
 
   case CBPeripheralManagerStatePoweredOff:
     NSLog(@"****Bluetooth is powered OFF.");
-    if (self.isAdvertisingStopped) {
+    if (nil != self.subscribedCentral) {
       NSLog(@"Started advertising after Bluetooth coming back on.");
       [self.myPeripheralManager startAdvertising:@{ CBAdvertisementDataLocalNameKey : @"Truma App",
         CBAdvertisementDataServiceUUIDsKey:@[[CBUUID UUIDWithString:@"61808880-b7b3-11e4-b3a4-0002a5d5c51b"]]}];
-      self.isAdvertisingStopped = FALSE;
+
+      self.subscribedCentral = nil;
+      self.messageQueue = [[NSMutableArray alloc] init];
     }
     break;
 
@@ -730,18 +837,21 @@
 }
 
 - (void)peripheralManager:(CBPeripheralManager *)peripheral didAddService:(CBService *)service error:(NSError *)error{
-  if (!error) {
-    if (self.isEndOfAddService) {
-      self.isEndOfAddService = FALSE;
-      NSLog(@"Started advertising after adding the services.");
-      [self.myPeripheralManager startAdvertising:@{ CBAdvertisementDataLocalNameKey : @"Truma App",
-        CBAdvertisementDataServiceUUIDsKey:@[[CBUUID UUIDWithString:@"61808880-b7b3-11e4-b3a4-0002a5d5c51b"]]}];
-      self.isAdvertisingStopped = FALSE;
-      CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
-      [self.commandDelegate sendPluginResult:result callbackId:[self.callbacks objectForKey:ADDSERVICE]];
-    }
-  }else{
+  if (nil != error) {
     CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR];
+    [self.commandDelegate sendPluginResult:result callbackId:[self.callbacks objectForKey:ADDSERVICE]];
+    return;
+  }
+  
+  if (isEndOfAddService) {
+    self.subscribedCentral = nil;
+    self.messageQueue = [[NSMutableArray alloc] init];
+    
+    isEndOfAddService = FALSE;
+    NSLog(@"Started advertising after adding the services.");
+    [self.myPeripheralManager startAdvertising:@{ CBAdvertisementDataLocalNameKey : @"Truma App",
+      CBAdvertisementDataServiceUUIDsKey:@[[CBUUID UUIDWithString:@"61808880-b7b3-11e4-b3a4-0002a5d5c51b"]]}];
+    CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
     [self.commandDelegate sendPluginResult:result callbackId:[self.callbacks objectForKey:ADDSERVICE]];
   }
 }
@@ -756,6 +866,8 @@
   CDVPluginResult* result;
   NSMutableDictionary *callbackInfo;
   CBCharacteristic *characteristicNotify;
+  
+  self.subscribedCentral = central;
 
   characteristicNotify = characteristic;
   service = characteristicNotify.service;
@@ -765,28 +877,30 @@
   // stop advertising
   NSLog(@"Stopped advertising.");
   [peripheral stopAdvertising];
-  self.isAdvertisingStopped = TRUE;
 
   [result setKeepCallbackAsBool:TRUE];
   [self.commandDelegate sendPluginResult:result callbackId:[self.callbacks valueForKey:EVENT_ONSUBSCRIBE]];
 }
 
 - (void)peripheralManager:(CBPeripheralManager *)peripheral central:(CBCentral *)central
-    didUnsubscribeFromCharacteristic:(CBCharacteristic *)characteristic{
+    didUnsubscribeFromCharacteristic:(CBCharacteristic *)characteristic
+{
   CBService *service;
   CDVPluginResult* result;
   NSMutableDictionary *callbackInfo;
   CBCharacteristic *characteristicNotify;
+  
+  self.subscribedCentral = nil;
+  self.messageQueue = [[NSMutableArray alloc] init];
 
   characteristicNotify = characteristic;
   service = characteristicNotify.service;
-  result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:callbackInfo];
   callbackInfo = [self getUniqueIDWithService:service andCharacteristicIndex:characteristicNotify];
+  result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:callbackInfo];
 
   NSLog(@"Started advertising.");
   [self.myPeripheralManager startAdvertising:@{ CBAdvertisementDataLocalNameKey : @"Truma App",
     CBAdvertisementDataServiceUUIDsKey:@[[CBUUID UUIDWithString:@"61808880-b7b3-11e4-b3a4-0002a5d5c51b"]]}];
-  self.isAdvertisingStopped = FALSE;
 
   [result setKeepCallbackAsBool:TRUE];
   [self.commandDelegate sendPluginResult:result callbackId:[self.callbacks valueForKey:EVENT_ONUNSUBSCRIBE]];
@@ -794,31 +908,7 @@
 
 - (void)peripheralManagerIsReadyToUpdateSubscribers:(CBPeripheralManager *)peripheral
 {
-  BOOL notified;
-
-  if (self.notifyData)
-  {
-    notified = [peripheral updateValue:self.notifyData forCharacteristic:self.notifyCharacteristic onSubscribedCentrals:nil];
-    if (notified)
-    {
-      CDVPluginResult *result;
-      NSMutableDictionary *info;
-
-      NSLog(@"-updateValue retry succeeded");
-
-      info = [[NSMutableDictionary alloc] init];
-      [info setValue:SUCCESS forKey:MES];
-      result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:info];
-
-      [self.commandDelegate sendPluginResult:result callbackId:self.notifyCallbackId];
-    }
-    else
-    {
-      NSLog(@"-updateValue retry failed");
-    }
-
-    self.notifyData = nil;
-  }
+  [self notifyUntilEmptyOrError];
 }
 
 - (void)peripheralManager:(CBPeripheralManager *)peripheral didReceiveReadRequest:(CBATTRequest *)request{
@@ -1032,6 +1122,7 @@
 }
 
 - (void)peripheral:(CBPeripheral *)peripheral didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic error:(NSError *)error {
+    BCLOG_FUNC(GATT_MODUAL)
     if (!error) {
         NSString *deviceAddress = [self getPeripheralUUID:peripheral];
         NSString *date = [NSString stringWithFormat:@"%@",[self getTime]];
